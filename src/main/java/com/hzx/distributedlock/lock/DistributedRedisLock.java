@@ -6,6 +6,8 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 
 
 import java.util.Arrays;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
@@ -32,7 +34,9 @@ public class DistributedRedisLock implements Lock {
     public DistributedRedisLock(StringRedisTemplate redisTemplate,String lockName,String uuid) {
         this.lockName = lockName;
         this.redisTemplate = redisTemplate;
-        this.uuid = uuid;
+        // 用于获取每个锁的id，每个服务每个线程要保证同一个id，确保分布式系统的情况不会出问题
+        // 给线程拼接唯一标识
+        this.uuid = uuid + ":" + Thread.currentThread().getId();
     }
 
     @Override
@@ -86,18 +90,15 @@ public class DistributedRedisLock implements Lock {
         // 锁的名字，id，过期时间：这里用的是StringRedisTemplate，所以要用String类型
         while (Boolean.FALSE.equals(this.redisTemplate.execute(new DefaultRedisScript<>(script, Boolean.class),
                 // 锁的名字，id，过期时间：这里用的是StringRedisTemplate，所以要用String类型
-                Arrays.asList(lockName), getId(), String.valueOf(expire)))){
+                Arrays.asList(lockName), uuid, String.valueOf(expire)))){
             // 获取不到锁一直重试，睡一会给别的线程机会
             Thread.sleep(30);
         }
 
-        return true;
-    }
+        // 加锁成功，返回之前,开启定时器自动续期锁
+        this.renewExpire();
 
-    // 用于获取每个锁的id，每个服务每个线程要保证同一个id，确保分布式系统的情况不会出问题
-    // 给线程拼接唯一标识
-    public String getId() {// 每个服务一个uuid，然后拼接服务中每个线程的id
-        return uuid + ":" + Thread.currentThread().getId();
+        return true;
     }
 
     /**
@@ -116,7 +117,7 @@ public class DistributedRedisLock implements Lock {
                 "else " +
                 "   return 0 " +
                 "end";
-        Long flag = this.redisTemplate.execute(new DefaultRedisScript<>(script, Long.class), Arrays.asList(lockName), getId());
+        Long flag = this.redisTemplate.execute(new DefaultRedisScript<>(script, Long.class), Arrays.asList(lockName), uuid);
         if(flag == null){// 恶意释放锁
             // 抛出一个监听状态异常
             throw new IllegalMonitorStateException("this lock doesn't belong to you!");
@@ -130,5 +131,37 @@ public class DistributedRedisLock implements Lock {
     @Override
     public Condition newCondition() {
         return null;
+    }
+
+
+
+
+    /**
+     * 锁自动续期：定时任务（时间驱动 Timer定时器） + lua脚本
+     *
+     */
+    public void renewExpire(){
+        // 判断自己的锁是否存在（hexists），如果存在则重置过期时间
+        String script = "if redis.call('hexists', KEYS[1], ARGV[1]) == 1 " +
+                "then " +
+                "   return redis.call('expire', KEYS[1], ARGV[2]) " +
+                "else " +
+                "   return 0 " +
+                "end";
+
+        new Timer().schedule(new TimerTask() {
+            @Override
+            public void run() {
+                if(redisTemplate.execute(new DefaultRedisScript<>(script,Boolean.class),// Lua脚本，返回值类型
+                        Arrays.asList(lockName),// key
+                        uuid,String.valueOf(expire))){// args
+                    // 续期成功，继续续期
+                    renewExpire();
+                }
+
+
+            }
+        },this.expire * 1000 / 3);
+
     }
 }

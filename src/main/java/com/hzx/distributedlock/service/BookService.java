@@ -7,6 +7,10 @@ import com.hzx.distributedlock.lock.DistributedRedisLock;
 import com.hzx.distributedlock.mapper.BookMapper;
 import com.hzx.distributedlock.pojo.Book;
 import org.apache.commons.lang3.StringUtils;
+import org.redisson.Redisson;
+import org.redisson.api.RLock;
+import org.redisson.api.RReadWriteLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
@@ -18,10 +22,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -46,12 +47,43 @@ public class BookService {
     @Autowired
     private DistributedLockClient distributedLockClient;
 
+    @Autowired
+    private RedissonClient redissonClient;
+
 
     /**
-     * Redis实现可重入锁：hash数据模型 + lua脚本
-     *
+     * Redisson自带的分布式锁，比我们自己封装的分布式锁性能要好，吞吐量达到1100
      */
     public void deBook() {
+
+        RLock lock = this.redissonClient.getLock("lock");
+        lock.lock();
+
+
+        try {
+            // 1.查询库存信息
+            String stock = redisTemplate.opsForValue().get("stock");
+
+            // 2.更新库存
+            if (stock != null && stock.length() != 0) {
+                int kc = Integer.parseInt(stock);
+                if (kc > 0) {
+                    // 3.扣减库存
+                    redisTemplate.opsForValue().set("stock", String.valueOf(--kc));
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+
+
+    }
+
+
+    /**
+     * Redis实现可重入锁：hash数据模型 + lua脚本；吞吐量600
+     */
+    public void deBook5() {
         // 获取redis可重入锁
         DistributedRedisLock redisLock = distributedLockClient.getRedisLock("lock");
         // 加锁
@@ -71,17 +103,29 @@ public class BookService {
                 }
             }
 //            this.test();// 测试可重入锁，当用有锁的线程重复获取锁时value会增加
+
         } finally {
             redisLock.unlock();
         }
+    }
 
 
+    public static void main(String[] args) {
+        System.out.println("定时任务初始时间：" + System.currentTimeMillis());
+
+//        Timer定时器
+        new Timer().schedule(new TimerTask() {
+            @Override
+            public void run() {
+                System.out.println("定时任务执行时间：" + System.currentTimeMillis());
+            }
+        }, 5000, 10000);//delay：第一次执行延迟时间，period：周期时间
     }
 
     /**
      * 测试可重入锁，当用有锁的线程重复获取锁时value会增加
      */
-    public void test(){
+    public void test() {
         DistributedRedisLock lock = distributedLockClient.getRedisLock("lock");
         lock.lock();
         System.out.println("测试可重入锁....");
@@ -242,4 +286,24 @@ public class BookService {
             lock.unlock();
         }
     }
+
+    public void testReadLock() {
+        RReadWriteLock rwLock = this.redissonClient.getReadWriteLock("rwLock");
+        // 加读锁
+        rwLock.readLock().lock(10,TimeUnit.SECONDS);
+        // TODO:一系列读操作...
+        rwLock.readLock().unlock();
+
+    }
+
+    public void testWriteLock() {
+        RReadWriteLock rwLock = this.redissonClient.getReadWriteLock("rwLock");
+        // 加读锁
+        rwLock.writeLock().lock(10,TimeUnit.SECONDS);
+        // TODO:一系列写操作...
+        rwLock.writeLock().unlock();
+    }
+
+
+
 }
